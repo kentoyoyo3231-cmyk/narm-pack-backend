@@ -7,6 +7,7 @@ const mqttService = require('./services/mqtt');
 const ordersRouter = require('./routes/orders');
 const webhookRouter = require('./routes/webhook');
 const adminRouter = require('./routes/admin');
+const compartmentsRouter = require('./routes/compartments');
 
 const app = express();
 app.use(cors());
@@ -19,6 +20,7 @@ app.get('/health', (req, res) => {
 app.use('/api/orders', ordersRouter);
 app.use('/api/payment-webhook', webhookRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/compartments', compartmentsRouter);
 
 app.use((err, req, res, next) => {
   console.error('[server] unhandled error:', err);
