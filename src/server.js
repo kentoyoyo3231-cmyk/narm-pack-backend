@@ -14,13 +14,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve the customer-facing web app (public/index.html) as a real, permanent
-// public page — same Railway URL that already hosts the API now also hosts
-// the site itself, so there's no separate hosting service/account to manage
-// and no risk of a temporary drag-and-drop link expiring. Anything under
-// /api/* below still takes priority since Express checks routes in order,
-// so this doesn't shadow the API.
-app.use(express.static(path.join(__dirname, '..', 'public')));
+// Serve the customer-facing web app (index.html, sitting at the repo root
+// next to package.json) as a real, permanent public page — same Railway URL
+// that already hosts the API now also hosts the site itself, so there's no
+// separate hosting service/account to manage and no risk of a temporary
+// drag-and-drop link expiring.
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'index.html'));
+});
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, mqttConnected: mqttService.isConnected() });
