@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Narm Pack — ตู้น้ำดื่มอัตโนมัติ (เชื่อมต่อ ESP32 จริง)</title>
+<title>Narm Pack — ตู้น้ำดื่มอัตโนมัติ </title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
@@ -269,7 +269,22 @@ class BackendBridge {
   }
   _load() {
     try {
-      this.baseUrl = (localStorage.getItem("narmpack_backend_url") || "").replace(/\/+$/, "");
+      const saved = (localStorage.getItem("narmpack_backend_url") || "").replace(/\/+$/, "");
+      if (saved) {
+        // Explicit override, set once via the Admin page — always wins.
+        this.baseUrl = saved;
+      } else if (typeof window !== "undefined" && /^https?:$/.test(window.location.protocol)) {
+        // No saved URL yet, but this page is being served BY the backend
+        // itself (e.g. https://your-app.up.railway.app/) — same origin IS
+        // the backend, so every new visitor/device works with zero setup
+        // instead of each customer having to paste the Backend URL in on
+        // their own phone before they can buy anything.
+        this.baseUrl = window.location.origin;
+      } else {
+        // Opened as a local file (file://) for testing — no origin to
+        // infer from, fall back to the old "set it manually" flow.
+        this.baseUrl = "";
+      }
       this.adminToken = localStorage.getItem("narmpack_backend_admin_token") || "";
     } catch (e) {}
   }
