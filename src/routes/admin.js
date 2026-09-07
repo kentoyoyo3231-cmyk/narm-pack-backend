@@ -7,7 +7,6 @@ const { requireAdmin, JWT_SECRET } = require('../middleware/auth');
 
 const router = express.Router();
 
-// POST /api/admin/login  { username, password }
 router.post('/login', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
@@ -25,10 +24,8 @@ router.post('/login', (req, res) => {
   res.json({ token, expiresIn: '12h' });
 });
 
-// Everything below this line requires a valid admin token.
 router.use(requireAdmin);
 
-// GET /api/admin/transactions?status=&machine_id=&limit=
 router.get('/transactions', (req, res) => {
   const { status, machine_id, limit = 100 } = req.query;
   let query = 'SELECT * FROM transactions WHERE 1=1';
@@ -46,7 +43,6 @@ router.get('/transactions', (req, res) => {
   res.json(db.prepare(query).all(...params));
 });
 
-// GET /api/admin/machines — online/offline derived from the heartbeat feed
 router.get('/machines', (req, res) => {
   const HEARTBEAT_STALE_AFTER_SEC = 120;
   const rows = db.prepare('SELECT * FROM machines').all().map((m) => {
@@ -60,7 +56,6 @@ router.get('/machines', (req, res) => {
   res.json(rows);
 });
 
-// GET /api/admin/compartments?machine_id=
 router.get('/compartments', (req, res) => {
   const { machine_id } = req.query;
   const rows = machine_id
@@ -69,9 +64,25 @@ router.get('/compartments', (req, res) => {
   res.json(rows);
 });
 
-// POST /api/admin/manual-open  { machine_id, compartment_no }
-// Emergency override — e.g. customer paid but the hardware never
-// confirmed, or a locker is jammed and needs a manual nudge.
+router.patch('/compartments/:id', (req, res) => {
+  const { status } = req.body || {};
+  const allowed = ['available', 'sold', 'maintenance'];
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` });
+  }
+
+  const compartment = db.prepare('SELECT * FROM compartments WHERE id = ?').get(req.params.id);
+  if (!compartment) return res.status(404).json({ error: 'compartment not found' });
+
+  db.prepare('UPDATE compartments SET status = ? WHERE id = ?').run(status, compartment.id);
+  db.prepare(
+    `INSERT INTO hardware_logs (machine_id, compartment_no, event, detail)
+     VALUES (?, ?, 'manual_override', ?)`
+  ).run(compartment.machine_id, compartment.compartment_no, `status -> ${status} by admin ${req.admin.username}`);
+
+  res.json(db.prepare('SELECT * FROM compartments WHERE id = ?').get(compartment.id));
+});
+
 router.post('/manual-open', (req, res) => {
   const { machine_id, compartment_no } = req.body || {};
   if (!machine_id || !compartment_no) {
@@ -90,7 +101,6 @@ router.post('/manual-open', (req, res) => {
   }
 });
 
-// GET /api/admin/hardware-logs?machine_id=&limit=
 router.get('/hardware-logs', (req, res) => {
   const { machine_id, limit = 200 } = req.query;
   const rows = machine_id
