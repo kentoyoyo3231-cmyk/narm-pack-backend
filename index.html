@@ -1,0 +1,1372 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Narm Pack — ตู้น้ำดื่มอัตโนมัติ (เชื่อมต่อ ESP32 จริง)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { font-family: 'Kanit', -apple-system, BlinkMacSystemFont, sans-serif; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useRef, useMemo } = React;
+
+/* ---------------------------------------------------------
+   HARDWARE BRIDGE — Web Serial connection to the ESP32.
+   Talks to the same firmware tested earlier (vending_relay_test.ino):
+     "1"   -> pulse relay once (auto ON then OFF after RUN_TIME_MS)
+     "on"  -> hold relay ON
+     "off" -> hold relay OFF
+   Requires Chrome or Edge, opened as a real page (not an embedded
+   preview) so the browser can grant access to a serial (COM) port.
+--------------------------------------------------------- */
+class SerialBridge {
+  constructor() {
+    this.port = null;
+    this.writer = null;
+    this.reader = null;
+    this.keepReading = false;
+    this.lineBuffer = "";
+    this.onLine = null;
+  }
+  isSupported() {
+    return "serial" in navigator;
+  }
+  async connect(baudRate = 115200) {
+    if (!this.isSupported()) {
+      throw new Error("เบราว์เซอร์นี้ไม่รองรับ Web Serial — ใช้ Chrome หรือ Edge บนคอมพิวเตอร์");
+    }
+    this.port = await navigator.serial.requestPort();
+    await this.port.open({ baudRate });
+    const encoder = new TextEncoderStream();
+    encoder.readable.pipeTo(this.port.writable);
+    this.writer = encoder.writable.getWriter();
+    this.keepReading = true;
+    this._readLoop();
+  }
+  async _readLoop() {
+    const decoder = new TextDecoderStream();
+    this.port.readable.pipeTo(decoder.writable).catch(() => {});
+    this.reader = decoder.readable.getReader();
+    try {
+      while (this.keepReading) {
+        const { value, done } = await this.reader.read();
+        if (done) break;
+        if (value) {
+          this.lineBuffer += value;
+          let idx;
+          while ((idx = this.lineBuffer.indexOf("\n")) >= 0) {
+            const line = this.lineBuffer.slice(0, idx).replace(/\r$/, "");
+            this.lineBuffer = this.lineBuffer.slice(idx + 1);
+            if (line.length && this.onLine) this.onLine(line);
+          }
+        }
+      }
+    } catch (e) {
+      if (this.onLine) this.onLine("[ERROR] " + e.message);
+    } finally {
+      try { this.reader.releaseLock(); } catch (e) {}
+    }
+  }
+  async send(text) {
+    if (!this.writer) throw new Error("ยังไม่ได้เชื่อมต่อกับ ESP32");
+    await this.writer.write(text + "\n");
+  }
+  async disconnect() {
+    this.keepReading = false;
+    try { await this.reader && this.reader.cancel(); } catch (e) {}
+    try { this.writer && this.writer.releaseLock(); } catch (e) {}
+    try { await this.port && this.port.close(); } catch (e) {}
+    this.port = null;
+    this.writer = null;
+  }
+}
+
+function useSerialBridge() {
+  const bridgeRef = useRef(null);
+  const pendingRef = useRef(null);
+  const [connected, setConnected] = useState(false);
+  const [log, setLog] = useState([]);
+  const [error, setError] = useState("");
+
+  if (!bridgeRef.current) {
+    bridgeRef.current = new SerialBridge();
+    bridgeRef.current.onLine = (line) => {
+      setLog((prev) => [...prev.slice(-59), line]);
+      if (line.includes("[RELAY] OFF") && pendingRef.current) {
+        pendingRef.current();
+        pendingRef.current = null;
+      }
+    };
+  }
+
+  const connect = async () => {
+    setError("");
+    try {
+      await bridgeRef.current.connect(115200);
+      setConnected(true);
+    } catch (e) {
+      setError(e.message || String(e));
+      setConnected(false);
+    }
+  };
+
+  const disconnect = async () => {
+    await bridgeRef.current.disconnect();
+    setConnected(false);
+  };
+
+  // Sends "1" (pulse relay) and resolves once the device reports
+  // [RELAY] OFF, or after a 4s safety timeout — whichever is first.
+  const sendUnlock = () =>
+    new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        pendingRef.current = null;
+        resolve();
+      };
+      pendingRef.current = finish;
+      setTimeout(finish, 4000);
+      bridgeRef.current.send("1").catch(() => finish());
+    });
+
+  return { connected, connect, disconnect, sendUnlock, log, error, supported: bridgeRef.current.isSupported() };
+}
+
+/* ---------------------------------------------------------
+   CLOUD BRIDGE — sends the unlock command over the internet via
+   Adafruit IO (MQTT-over-HTTP feed), instead of a USB cable. Works
+   from ANY device/browser (including phones), and from a real
+   hosted URL, since it's a plain HTTPS fetch() — not Web Serial.
+   The real 30-locker cabinet is expected to use this path, with
+   the ESP32 wired to WiFi instead of a laptop's USB port.
+   Credentials are entered once by the admin (never sent through
+   chat) and kept only in this browser's localStorage.
+--------------------------------------------------------- */
+class CloudBridge {
+  constructor() {
+    this.username = "";
+    this.key = "";
+    this.feed = "vending-unlock";
+    this._load();
+  }
+  _load() {
+    try {
+      this.username = localStorage.getItem("narmpack_aio_username") || "";
+      this.key = localStorage.getItem("narmpack_aio_key") || "";
+      this.feed = localStorage.getItem("narmpack_aio_feed") || "vending-unlock";
+    } catch (e) {}
+  }
+  isConfigured() {
+    return !!(this.username && this.key);
+  }
+  setCredentials(username, key, feed) {
+    this.username = (username || "").trim();
+    this.key = (key || "").trim();
+    this.feed = (feed || "vending-unlock").trim();
+    try {
+      localStorage.setItem("narmpack_aio_username", this.username);
+      localStorage.setItem("narmpack_aio_key", this.key);
+      localStorage.setItem("narmpack_aio_feed", this.feed);
+    } catch (e) {}
+  }
+  clearCredentials() {
+    this.username = "";
+    this.key = "";
+    try {
+      localStorage.removeItem("narmpack_aio_username");
+      localStorage.removeItem("narmpack_aio_key");
+    } catch (e) {}
+  }
+  async sendUnlock(lockerId) {
+    if (!this.isConfigured()) {
+      throw new Error("ยังไม่ได้ตั้งค่า Adafruit IO — ใส่ Username กับ AIO Key ในหน้า Admin ก่อน");
+    }
+    const url = `https://io.adafruit.com/api/v2/${encodeURIComponent(this.username)}/feeds/${encodeURIComponent(this.feed)}/data`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-AIO-Key": this.key },
+      body: JSON.stringify({ value: String(lockerId != null ? lockerId : 1) }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch (e) {}
+      throw new Error(`ส่งคำสั่งไป Adafruit IO ไม่สำเร็จ (${res.status}) ${detail}`);
+    }
+    return true;
+  }
+}
+
+function useCloudBridge() {
+  const bridgeRef = useRef(null);
+  if (!bridgeRef.current) bridgeRef.current = new CloudBridge();
+  const [configured, setConfigured] = useState(bridgeRef.current.isConfigured());
+  const [username, setUsername] = useState(bridgeRef.current.username);
+  const [feed, setFeed] = useState(bridgeRef.current.feed);
+  const [log, setLog] = useState([]);
+  const [error, setError] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const saveCredentials = (u, k, f) => {
+    bridgeRef.current.setCredentials(u, k, f);
+    setConfigured(bridgeRef.current.isConfigured());
+    setUsername(bridgeRef.current.username);
+    setFeed(bridgeRef.current.feed);
+    setLog((prev) => [...prev.slice(-59), `[AIO] บันทึกการตั้งค่าแล้ว (${bridgeRef.current.username} / feed: ${bridgeRef.current.feed})`]);
+  };
+  const clearCredentials = () => {
+    bridgeRef.current.clearCredentials();
+    setConfigured(false);
+    setUsername("");
+    setLog((prev) => [...prev.slice(-59), "[AIO] ล้างการตั้งค่าแล้ว"]);
+  };
+  const sendUnlock = async (lockerId) => {
+    setError("");
+    setSending(true);
+    try {
+      await bridgeRef.current.sendUnlock(lockerId);
+      setLog((prev) => [...prev.slice(-59), `[AIO] ส่งคำสั่งเปิดช่อง #${lockerId} แล้ว`]);
+    } catch (e) {
+      setError(e.message || String(e));
+      setLog((prev) => [...prev.slice(-59), `[AIO][ERROR] ${e.message || e}`]);
+      throw e;
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return { configured, username, feed, saveCredentials, clearCredentials, sendUnlock, log, error, sending };
+}
+
+/* ---------------------------------------------------------
+   BACKEND BRIDGE — talks to the Narm Pack backend server
+   (Node/Express) instead of hitting Adafruit IO directly from
+   the browser. The backend holds the Adafruit IO / MQTT
+   credentials server-side, creates orders, verifies payment
+   webhooks, and only then tells the ESP32 to unlock — so once
+   this is configured, the browser never needs an Adafruit IO
+   key at all. Only the backend's own URL (and, for admin
+   actions, a login token) is stored here, in localStorage.
+--------------------------------------------------------- */
+class BackendBridge {
+  constructor() {
+    this.baseUrl = "";
+    this.adminToken = "";
+    this._load();
+  }
+  _load() {
+    try {
+      this.baseUrl = (localStorage.getItem("narmpack_backend_url") || "").replace(/\/+$/, "");
+      this.adminToken = localStorage.getItem("narmpack_backend_admin_token") || "";
+    } catch (e) {}
+  }
+  isConfigured() {
+    return !!this.baseUrl;
+  }
+  isAdminLoggedIn() {
+    return !!this.adminToken;
+  }
+  setBaseUrl(url) {
+    this.baseUrl = (url || "").trim().replace(/\/+$/, "");
+    try { localStorage.setItem("narmpack_backend_url", this.baseUrl); } catch (e) {}
+  }
+  clearBaseUrl() {
+    this.baseUrl = "";
+    this.adminToken = "";
+    try {
+      localStorage.removeItem("narmpack_backend_url");
+      localStorage.removeItem("narmpack_backend_admin_token");
+    } catch (e) {}
+  }
+  async _json(res, failMsg) {
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch (e) {}
+      throw new Error(`${failMsg} (${res.status})${detail ? " " + detail : ""}`);
+    }
+    return res.json();
+  }
+  async createOrder(compartmentId) {
+    if (!this.isConfigured()) throw new Error("ยังไม่ได้ตั้งค่า Backend URL — ใส่ที่หน้า Admin ก่อน");
+    const res = await fetch(`${this.baseUrl}/api/orders`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ compartment_id: compartmentId }),
+    });
+    return this._json(res, "สร้างคำสั่งซื้อไม่สำเร็จ");
+  }
+  async getOrder(orderId) {
+    const res = await fetch(`${this.baseUrl}/api/orders/${encodeURIComponent(orderId)}`);
+    return this._json(res, "ตรวจสอบสถานะคำสั่งซื้อไม่สำเร็จ");
+  }
+  async simulatePay(orderId) {
+    const res = await fetch(`${this.baseUrl}/api/orders/${encodeURIComponent(orderId)}/simulate-pay`, { method: "POST" });
+    return this._json(res, "จำลองการจ่ายเงินไม่สำเร็จ");
+  }
+  async pollUntilSettled(orderId, { intervalMs = 1000, timeoutMs = 20000 } = {}) {
+    const start = Date.now();
+    const settledStatuses = ["unlocked", "unlock_sent", "failed", "expired"];
+    while (Date.now() - start < timeoutMs) {
+      const o = await this.getOrder(orderId);
+      if (settledStatuses.includes(o.status)) return o;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    throw new Error("หมดเวลารอผลจากเซิร์ฟเวอร์ — ลองตรวจสอบสถานะอีกครั้งภายหลัง");
+  }
+  async adminLogin(username, password) {
+    const res = await fetch(`${this.baseUrl}/api/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await this._json(res, "เข้าสู่ระบบแอดมินไม่สำเร็จ");
+    this.adminToken = data.token;
+    try { localStorage.setItem("narmpack_backend_admin_token", this.adminToken); } catch (e) {}
+    return data;
+  }
+  async adminManualOpen(machineId, compartmentNo) {
+    if (!this.adminToken) throw new Error("ยังไม่ได้เข้าสู่ระบบแอดมิน");
+    const res = await fetch(`${this.baseUrl}/api/admin/manual-open`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.adminToken}` },
+      body: JSON.stringify({ machine_id: machineId, compartment_no: compartmentNo }),
+    });
+    return this._json(res, "สั่งเปิดฉุกเฉินผ่าน Backend ไม่สำเร็จ");
+  }
+  // Public — no admin login needed. Lets the customer-facing screen show
+  // real stock/status instead of guessing, and lets us map a locker's
+  // display id (1-30) to its real database row id.
+  async getCompartments(machineId) {
+    const url = `${this.baseUrl}/api/compartments${machineId ? `?machine_id=${encodeURIComponent(machineId)}` : ""}`;
+    const res = await fetch(url);
+    return this._json(res, "โหลดสถานะช่องไม่สำเร็จ");
+  }
+  // Admin-only — used after physically refilling a compartment, to put it
+  // back on sale. compartmentId is the DB row id (compartment.id), not the
+  // 1-30 display number.
+  async adminSetCompartmentStatus(compartmentId, status) {
+    if (!this.adminToken) throw new Error("ยังไม่ได้เข้าสู่ระบบแอดมิน");
+    const res = await fetch(`${this.baseUrl}/api/admin/compartments/${compartmentId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.adminToken}` },
+      body: JSON.stringify({ status }),
+    });
+    return this._json(res, "อัปเดตสถานะช่องไม่สำเร็จ");
+  }
+}
+
+function useBackendBridge() {
+  const bridgeRef = useRef(null);
+  if (!bridgeRef.current) bridgeRef.current = new BackendBridge();
+  const [configured, setConfigured] = useState(bridgeRef.current.isConfigured());
+  const [baseUrl, setBaseUrlState] = useState(bridgeRef.current.baseUrl);
+  const [adminLoggedIn, setAdminLoggedIn] = useState(bridgeRef.current.isAdminLoggedIn());
+  const [log, setLog] = useState([]);
+  const [error, setError] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const pushLog = (line) => setLog((prev) => [...prev.slice(-59), line]);
+
+  const saveBaseUrl = (url) => {
+    bridgeRef.current.setBaseUrl(url);
+    setConfigured(bridgeRef.current.isConfigured());
+    setBaseUrlState(bridgeRef.current.baseUrl);
+    pushLog(`[BACKEND] ตั้งค่า URL แล้ว: ${bridgeRef.current.baseUrl}`);
+  };
+  const clearBaseUrl = () => {
+    bridgeRef.current.clearBaseUrl();
+    setConfigured(false);
+    setAdminLoggedIn(false);
+    setBaseUrlState("");
+    pushLog("[BACKEND] ล้างการตั้งค่าแล้ว");
+  };
+  const createOrder = async (compartmentId) => {
+    setError("");
+    try {
+      const o = await bridgeRef.current.createOrder(compartmentId);
+      pushLog(`[BACKEND] สร้างคำสั่งซื้อ ${o.orderId} สำหรับช่อง #${compartmentId} แล้ว`);
+      return o;
+    } catch (e) {
+      setError(e.message || String(e));
+      pushLog(`[BACKEND][ERROR] ${e.message || e}`);
+      throw e;
+    }
+  };
+  const simulatePay = async (orderId) => {
+    setSending(true);
+    setError("");
+    try {
+      const r = await bridgeRef.current.simulatePay(orderId);
+      pushLog(`[BACKEND] จำลองจ่ายเงินสำเร็จสำหรับ ${orderId}`);
+      return r;
+    } catch (e) {
+      setError(e.message || String(e));
+      pushLog(`[BACKEND][ERROR] ${e.message || e}`);
+      throw e;
+    } finally {
+      setSending(false);
+    }
+  };
+  const pollUntilSettled = async (orderId) => {
+    const settled = await bridgeRef.current.pollUntilSettled(orderId);
+    pushLog(`[BACKEND] สถานะล่าสุดของ ${orderId}: ${settled.status}`);
+    return settled;
+  };
+  const adminLogin = async (username, password) => {
+    setError("");
+    try {
+      await bridgeRef.current.adminLogin(username, password);
+      setAdminLoggedIn(true);
+      pushLog(`[BACKEND] แอดมินเข้าสู่ระบบแล้ว (${username})`);
+    } catch (e) {
+      setError(e.message || String(e));
+      pushLog(`[BACKEND][ERROR] ${e.message || e}`);
+      throw e;
+    }
+  };
+  const adminManualOpen = async (machineId, compartmentNo) => {
+    try {
+      const r = await bridgeRef.current.adminManualOpen(machineId, compartmentNo);
+      pushLog(`[BACKEND] สั่งเปิดฉุกเฉินช่อง #${compartmentNo} แล้ว`);
+      return r;
+    } catch (e) {
+      pushLog(`[BACKEND][ERROR] ${e.message || e}`);
+      throw e;
+    }
+  };
+  const getCompartments = async (machineId) => {
+    try {
+      return await bridgeRef.current.getCompartments(machineId);
+    } catch (e) {
+      pushLog(`[BACKEND][ERROR] ${e.message || e}`);
+      throw e;
+    }
+  };
+  const restockCompartment = async (compartmentId) => {
+    try {
+      const r = await bridgeRef.current.adminSetCompartmentStatus(compartmentId, "available");
+      pushLog(`[BACKEND] เติมของสำเร็จ (compartment id ${compartmentId} -> available)`);
+      return r;
+    } catch (e) {
+      pushLog(`[BACKEND][ERROR] ${e.message || e}`);
+      throw e;
+    }
+  };
+
+  return {
+    configured, baseUrl, saveBaseUrl, clearBaseUrl,
+    adminLoggedIn, adminLogin, adminManualOpen,
+    createOrder, simulatePay, pollUntilSettled,
+    getCompartments, restockCompartment,
+    log, error, sending,
+  };
+}
+
+/* ---------------------------------------------------------
+   ICONS — small hand-drawn stroke icons (no external icon
+   library needed) matching the outline style used across the UI.
+--------------------------------------------------------- */
+function Icon({ children, size = 18, className = "", strokeWidth = 2, viewBox = "0 0 24 24", fill = "none" }) {
+  return (
+    <svg width={size} height={size} viewBox={viewBox} fill={fill} stroke="currentColor" strokeWidth={strokeWidth}
+      strokeLinecap="round" strokeLinejoin="round" className={className}>
+      {children}
+    </svg>
+  );
+}
+const XIcon = (p) => <Icon {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></Icon>;
+const ChevronLeft = (p) => <Icon {...p}><polyline points="15 18 9 12 15 6"/></Icon>;
+const ChevronRight = (p) => <Icon {...p}><polyline points="9 18 15 12 9 6"/></Icon>;
+const CheckCircle2 = (p) => <Icon {...p}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></Icon>;
+const Loader2 = (p) => <Icon {...p}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></Icon>;
+const ShieldCheck = (p) => <Icon {...p}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></Icon>;
+const Wifi = (p) => <Icon {...p}><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 13a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></Icon>;
+const WifiOff = (p) => <Icon {...p}><line x1="2" y1="2" x2="22" y2="22"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M5 13a10 10 0 0 1 5.17-2.66"/><path d="M19 13a10 10 0 0 0-2.24-1.62"/><path d="M2 8.82a15 15 0 0 1 4.17-2.65"/><path d="M22 8.82a15 15 0 0 0-11.29-4.06"/><line x1="12" y1="20" x2="12.01" y2="20"/></Icon>;
+const LockIcon = (p) => <Icon {...p}><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></Icon>;
+const UnlockIcon = (p) => <Icon {...p}><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></Icon>;
+const QrCode = (p) => <Icon {...p} fill="currentColor" strokeWidth="0">
+  <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+  <rect x="14" y="14" width="3" height="3"/><rect x="18" y="14" width="3" height="3"/><rect x="14" y="18" width="3" height="3"/><rect x="18" y="18" width="3" height="3"/>
+</Icon>;
+const RotateCcw = (p) => <Icon {...p}><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></Icon>;
+const History = (p) => <Icon {...p}><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></Icon>;
+const Grid3x3 = (p) => <Icon {...p}>
+  <rect x="3" y="3" width="5" height="5"/><rect x="9.5" y="3" width="5" height="5"/><rect x="16" y="3" width="5" height="5"/>
+  <rect x="3" y="9.5" width="5" height="5"/><rect x="9.5" y="9.5" width="5" height="5"/><rect x="16" y="9.5" width="5" height="5"/>
+  <rect x="3" y="16" width="5" height="5"/><rect x="9.5" y="16" width="5" height="5"/><rect x="16" y="16" width="5" height="5"/>
+</Icon>;
+const KeyRound = (p) => <Icon {...p}><path d="M14.5 8.5a2.5 2.5 0 0 1 0 5"/><circle cx="8" cy="14" r="5.5"/><path d="m12.5 9.5 7-7"/><path d="m17 3 3 3"/></Icon>;
+const AlertTriangle = (p) => <Icon {...p}><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></Icon>;
+const UsbIcon = (p) => <Icon {...p}><circle cx="12" cy="6" r="2"/><path d="M12 8v6"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/><path d="M12 14 7 16"/><path d="M12 14l5 2"/></Icon>;
+
+/* ---------------------------------------------------------
+   DESIGN TOKENS — "clean water" palette
+--------------------------------------------------------- */
+const T = {
+  ink: "#0E1B2B", sub: "#6B7684", faint: "#9AA3AC",
+  bgTop: "#F3FAFC", bgBottom: "#FFFFFF",
+  hairline: "rgba(14,27,43,0.08)",
+  blue: "#0A84FF", aqua: "#2FD6C6", aquaDeep: "#12B5B0",
+  amber: "#FF9F0A", red: "#FF453A", grayFill: "#EDEFF1",
+};
+const waterGrad = `linear-gradient(135deg, ${T.blue} 0%, ${T.aqua} 100%)`;
+const waterGradSoft = `linear-gradient(135deg, rgba(10,132,255,0.10) 0%, rgba(47,214,198,0.10) 100%)`;
+
+function Logo({ size = 28, radius }) {
+  const r = radius ?? Math.round(size * 0.32);
+  return (
+    <div className="flex items-center justify-center shrink-0" style={{ width: size, height: size, borderRadius: r, background: waterGrad }}>
+      <svg width={size * 0.56} height={size * 0.56} viewBox="0 0 24 24" fill="none">
+        <path d="M12 2.4C12 2.4 4.6 12.1 4.6 16.9a7.4 7.4 0 0014.8 0c0-4.8-7.4-14.5-7.4-14.5z" fill="#FFFFFF" />
+        <line x1="8.7" y1="9.1" x2="15.3" y2="9.1" stroke={T.aquaDeep} strokeWidth="1" strokeLinecap="round" opacity="0.55" />
+        <path d="M8.1 13c1 2.9 3.5 3.5 5.1 3" stroke={T.aquaDeep} strokeWidth="1.2" strokeLinecap="round" fill="none" opacity="0.85" />
+      </svg>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   DATA — 4 SKUs, drawn bottle glyphs (no product photos in this
+   hardware-integration build; swap in real photos later).
+--------------------------------------------------------- */
+const PRODUCTS = [
+  { id: "namthip-600", brandEN: "NAMTHIP", brandTH: "น้ำทิพย์", size: "600 มล.", pack: 12, price: 67, color: "#2E9E4F" },
+  { id: "namthip-1500", brandEN: "NAMTHIP", brandTH: "น้ำทิพย์", size: "1500 มล.", pack: 6, price: 67, color: "#2E9E4F" },
+  { id: "crystal-600", brandEN: "CRYSTAL", brandTH: "คริสตัล", size: "600 มล.", pack: 12, price: 67, color: "#2E8FD6" },
+  { id: "crystal-1500", brandEN: "CRYSTAL", brandTH: "คริสตัล", size: "1500 มล.", pack: 6, price: 67, color: "#2E8FD6" },
+];
+const CABINET_COLS = 6;
+const CABINET_ROWS = 5;
+// Must match DEFAULT_MACHINE_ID on the backend (Railway env var) — this is
+// how the frontend knows which machine's compartments to fetch/restock.
+const DEFAULT_MACHINE_ID = "machine-01";
+const SHELF_PRODUCTS = [PRODUCTS[0], PRODUCTS[1], PRODUCTS[2], PRODUCTS[3], PRODUCTS[0]];
+const seedLockers = () =>
+  Array.from({ length: CABINET_ROWS * CABINET_COLS }, (_, i) => {
+    const id = i + 1;
+    const row = Math.floor(i / CABINET_COLS);
+    const col = i % CABINET_COLS;
+    const product = SHELF_PRODUCTS[row];
+    const roll = (i * 37) % 11;
+    const status = roll === 0 ? "soldout" : roll === 10 ? "offline" : "available";
+    return { id, row, col, product, status };
+  });
+const money = (n) => `฿${n.toFixed(0)}`;
+
+function FakeQR({ seed = 1 }) {
+  const cells = useMemo(() => {
+    let s = seed * 9301 + 49297;
+    const rnd = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+    return Array.from({ length: 11 * 11 }, () => rnd() > 0.52);
+  }, [seed]);
+  return (
+    <div className="grid grid-cols-11 gap-[2px] bg-white p-3 rounded-xl w-fit mx-auto">
+      {cells.map((on, i) => {
+        const r = Math.floor(i / 11);
+        const c = i % 11;
+        const isEye = (r < 3 && c < 3) || (r < 3 && c > 7) || (r > 7 && c < 3);
+        return (
+          <div key={i} className={`w-4 h-4 rounded-[1px] ${isEye ? (r % 3 === 0 || c % 3 === 0 ? "bg-[#0E1B2B]" : "bg-white") : (on ? "bg-[#0E1B2B]" : "bg-white")}`} />
+        );
+      })}
+    </div>
+  );
+}
+
+function CountdownRing({ pct, label }) {
+  const r = 26;
+  const c = 2 * Math.PI * r;
+  return (
+    <div className="relative w-[64px] h-[64px] mx-auto">
+      <svg width="64" height="64" className="-rotate-90">
+        <circle cx="32" cy="32" r={r} stroke={T.hairline} strokeWidth="5" fill="none" />
+        <circle cx="32" cy="32" r={r} stroke="url(#ringGrad)" strokeWidth="5" fill="none"
+          strokeDasharray={c} strokeDashoffset={c * (1 - pct)} strokeLinecap="round"
+          style={{ transition: "stroke-dashoffset 1s linear" }} />
+        <defs>
+          <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor={T.blue} /><stop offset="100%" stopColor={T.aqua} />
+          </linearGradient>
+        </defs>
+      </svg>
+      <div className="absolute inset-0 flex items-center justify-center">
+        <span className="text-[11px] font-semibold text-[#0E1B2B] tabular-nums">{label}</span>
+      </div>
+    </div>
+  );
+}
+
+function BottleGlyph({ color = T.aquaDeep, size = 64 }) {
+  return (
+    <svg width={size} height={size * 1.35} viewBox="0 0 48 64" fill="none">
+      <path d="M19 2h10v7.5c0 1 .4 1.8 1.1 2.6C32.6 14.8 34 17.5 34 21v36a5 5 0 01-5 5H19a5 5 0 01-5-5V21c0-3.5 1.4-6.2 3.9-8.9.7-.8 1.1-1.6 1.1-2.6V2z"
+        fill="white" stroke="#D9DEE3" strokeWidth="1.2" />
+      <rect x="18" y="4" width="12" height="4" rx="1" fill="#D9DEE3" />
+      <rect x="14" y="30" width="20" height="18" rx="2" fill={color} />
+      <rect x="14" y="30" width="20" height="4" fill="white" opacity="0.35" />
+    </svg>
+  );
+}
+
+function CabinetCell({ locker, onSelect }) {
+  const disabled = locker.status !== "available";
+  const p = locker.product;
+  const statusColor = locker.status === "available" ? T.aquaDeep : locker.status === "soldout" ? T.faint : T.red;
+  const statusText = locker.status === "available" ? money(p.price) : locker.status === "soldout" ? "หมด" : "ปิด";
+  return (
+    <button onClick={() => !disabled && onSelect(locker.id)} disabled={disabled}
+      className={`relative flex flex-col items-center justify-between rounded-[14px] pt-4 pb-1.5 px-1 transition-all duration-150 ${disabled ? "opacity-45 cursor-not-allowed" : "active:scale-[0.93]"}`}
+      style={{ background: "#FFFFFF", border: `1px solid ${T.hairline}`, boxShadow: disabled ? "none" : "0 1px 2px rgba(14,27,43,0.05)", aspectRatio: "4 / 5" }}>
+      <span className="absolute top-1 left-1.5 text-[8px] font-bold text-[#B9C0C6] tabular-nums">{String(locker.id).padStart(2, "0")}</span>
+      <span className="absolute top-1.5 right-1.5 w-[5px] h-[5px] rounded-full" style={{ background: statusColor }} />
+      <div className="flex-1 w-full flex items-center justify-center">
+        <BottleGlyph color={p.color} size={24} />
+      </div>
+      <span className="text-[10px] font-bold tabular-nums" style={{ color: locker.status === "available" ? T.ink : T.faint }}>{statusText}</span>
+    </button>
+  );
+}
+
+function Sheet({ open, onClose, children }) {
+  return (
+    <div className={`fixed inset-0 z-40 flex items-end justify-center transition-opacity duration-300 ${open ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
+      <div className="absolute inset-0 bg-[#0E1B2B]/35 backdrop-blur-[2px]" onClick={onClose} />
+      <div className={`relative w-full max-h-[88vh] overflow-y-auto bg-white rounded-t-[28px] px-6 pt-3 pb-7 transition-transform duration-[350ms] ease-out ${open ? "translate-y-0" : "translate-y-full"}`}
+        style={{ boxShadow: "0 -8px 40px rgba(14,27,43,0.18)" }}>
+        <div className="w-9 h-[5px] rounded-full bg-[#E4E7EB] mx-auto mb-4" />
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   LANDING — now with a real "connect to ESP32" step instead of
+   a fake status card.
+--------------------------------------------------------- */
+function LandingScreen({ serial, cloud, backend, onStart }) {
+  const steps = ["เลือกช่องที่ต้องการ", "จ่ายผ่าน PromptPay", "ประตูปลดล็อกอัตโนมัติ (สั่งงาน ESP32 จริง)"];
+  const hwConnected = backend.configured || cloud.configured || serial.connected;
+  return (
+    <div className="min-h-full flex flex-col px-7 pt-14 pb-8" style={{ background: `linear-gradient(180deg, ${T.bgTop} 0%, ${T.bgBottom} 420px)` }}>
+      <div className="flex flex-col items-center text-center">
+        <Logo size={64} radius={20} />
+        <h1 className="text-[26px] font-bold text-[#0E1B2B] tracking-tight mt-4">Narm Pack</h1>
+        <p className="text-[14px] mt-1" style={{ color: T.sub }}>ตู้น้ำดื่มอัตโนมัติ · ไม่ต้องพกเงินสด</p>
+      </div>
+
+      <div className="mt-8 rounded-2xl p-4" style={{ background: "#fff", border: `1px solid ${T.hairline}`, boxShadow: "0 1px 2px rgba(14,27,43,0.04)" }}>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-[11px]" style={{ color: T.faint }}>สถานะเชื่อมต่อ ESP32</p>
+            <p className="text-[17px] font-bold text-[#0E1B2B] tracking-tight mt-0.5">
+              {backend.configured ? "ออนไลน์ผ่าน Backend Server" : cloud.configured ? "ออนไลน์ผ่านคลาวด์ (Adafruit IO)" : serial.connected ? "เชื่อมต่อผ่าน USB แล้ว" : "ยังไม่ได้เชื่อมต่อ"}
+            </p>
+          </div>
+          <span className="flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-full shrink-0"
+            style={{ color: hwConnected ? T.aquaDeep : T.red, background: hwConnected ? "rgba(47,214,198,0.12)" : "rgba(255,69,58,0.10)" }}>
+            {hwConnected ? <Wifi size={11} /> : <WifiOff size={11} />}
+            {hwConnected ? "ออนไลน์" : "ออฟไลน์"}
+          </span>
+        </div>
+        {(backend.configured || cloud.configured) ? (
+          <p className="text-[11.5px] mt-3" style={{ color: T.sub }}>
+            ตั้งค่าเชื่อมต่อออนไลน์ไว้แล้ว (แก้ไข/ตัดการเชื่อมต่อได้ที่หน้า Admin)
+          </p>
+        ) : !serial.connected ? (
+          <button onClick={serial.connect}
+            className="mt-3 w-full flex items-center justify-center gap-2 text-[13.5px] font-semibold py-2.5 rounded-xl text-white"
+            style={{ background: T.ink }}>
+            <UsbIcon size={15} /> เชื่อมต่อ ESP32 ผ่าน USB
+          </button>
+        ) : (
+          <button onClick={serial.disconnect}
+            className="mt-3 w-full flex items-center justify-center gap-2 text-[13px] font-medium py-2 rounded-xl"
+            style={{ background: T.grayFill, color: T.sub }}>
+            ตัดการเชื่อมต่อ
+          </button>
+        )}
+        {!backend.configured && !cloud.configured && !serial.supported && (
+          <p className="text-[11px] mt-2 flex items-start gap-1" style={{ color: T.red }}>
+            <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+            เบราว์เซอร์นี้ไม่รองรับ Web Serial — เปิดหน้านี้ด้วย Chrome หรือ Edge บนคอม หรือใช้การเชื่อมต่อออนไลน์แทน
+          </p>
+        )}
+        {serial.error && (
+          <p className="text-[11px] mt-2" style={{ color: T.red }}>{serial.error}</p>
+        )}
+      </div>
+
+      <div className="mt-8">
+        <p className="text-[12px] font-semibold mb-3 tracking-wide" style={{ color: T.sub }}>ขั้นตอนการใช้งาน</p>
+        <div className="flex flex-col gap-3">
+          {steps.map((t, i) => (
+            <div key={i} className="flex items-center gap-3">
+              <span className="w-8 h-8 rounded-full flex items-center justify-center text-[13px] font-bold shrink-0" style={{ background: waterGradSoft, color: T.aquaDeep }}>{i + 1}</span>
+              <span className="text-[15px] font-medium text-[#0E1B2B]">{t}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <button onClick={onStart}
+        className="mt-10 w-full text-white font-semibold text-[16px] py-4 rounded-2xl active:scale-[0.98] transition-transform"
+        style={{ background: waterGrad, boxShadow: "0 10px 24px -10px rgba(10,132,255,0.55)" }}>
+        เลือกช่องสินค้า
+      </button>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   CUSTOMER FLOW
+--------------------------------------------------------- */
+function CustomerApp({ lockers, setLockers, pushTx, serial, cloud, backend }) {
+  const [view, setView] = useState("landing");
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [stage, setStage] = useState("confirm");
+  const [selectedId, setSelectedId] = useState(null);
+  const [timeLeft, setTimeLeft] = useState(180);
+  const [hwError, setHwError] = useState("");
+  const [order, setOrder] = useState(null);
+  const timerRef = useRef(null);
+  const selected = lockers.find((l) => l.id === selectedId);
+  const hwConnected = backend.configured || cloud.configured || serial.connected;
+
+  useEffect(() => {
+    if (stage !== "payment") return;
+    setTimeLeft(180);
+    timerRef.current = setInterval(() => {
+      setTimeLeft((t) => {
+        if (t <= 1) { clearInterval(timerRef.current); closeSheet(); return 0; }
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerRef.current);
+  }, [stage]);
+
+  const mm = String(Math.floor(timeLeft / 60)).padStart(2, "0");
+  const ss = String(timeLeft % 60).padStart(2, "0");
+
+  const openFor = (id) => { setSelectedId(id); setStage("confirm"); setSheetOpen(true); };
+  const closeSheet = () => { setSheetOpen(false); setTimeout(() => { setSelectedId(null); setOrder(null); }, 300); };
+
+  // Moving to the QR/payment step is also when a real order gets created
+  // with the backend (if configured) — mirrors what a real machine does:
+  // an order exists BEFORE payment, so the webhook has something to match
+  // against when it arrives.
+  const goToPayment = async () => {
+    setHwError("");
+    setStage("payment");
+    if (backend.configured) {
+      try {
+        const o = await backend.createOrder(selected && selected.dbId != null ? selected.dbId : selectedId);
+        setOrder(o);
+      } catch (e) {
+        setHwError(e.message || String(e));
+      }
+    }
+  };
+
+  const confirmPayment = async () => {
+    clearInterval(timerRef.current);
+    setHwError("");
+    setStage("checking");
+    // Real hardware path, in priority order:
+    //   1. Backend server (recommended) — creates a real order, runs the
+    //      exact payment-webhook code path, and only unlocks after that
+    //      succeeds. Here we trigger a "simulate paid" webhook instead of
+    //      a real Beam payment, but the code path is identical.
+    //   2. Direct cloud (Adafruit IO) — legacy path from the early bench
+    //      test, kept as a fallback for quick testing without a backend.
+    //   3. Direct USB — for testing with a laptop plugged straight in.
+    //   4. Nothing configured — just demo the delay so the UI still works.
+    try {
+      if (backend.configured) {
+        if (!order) throw new Error("ยังไม่ได้สร้างคำสั่งซื้อกับ Backend — ปิดหน้าต่างนี้แล้วลองใหม่อีกครั้ง");
+        await backend.simulatePay(order.orderId);
+        const settled = await backend.pollUntilSettled(order.orderId);
+        if (settled.status === "failed" || settled.status === "expired") {
+          throw new Error(`Backend ปลดล็อกไม่สำเร็จ (สถานะ: ${settled.status}) — ลองใหม่หรือแจ้งผู้ดูแลตู้`);
+        }
+      } else if (cloud.configured) {
+        await cloud.sendUnlock(selectedId);
+      } else if (serial.connected) {
+        await serial.sendUnlock(selectedId);
+      } else {
+        await new Promise((r) => setTimeout(r, 1800));
+      }
+    } catch (e) {
+      setHwError(e.message || String(e));
+      setStage("payment");
+      return;
+    }
+    setLockers((prev) => prev.map((l) => (l.id === selectedId ? { ...l, status: "soldout" } : l)));
+    pushTx({
+      id: order ? order.orderId : `TX-${Date.now().toString().slice(-6)}`,
+      locker: selectedId,
+      brand: `${selected.product.brandTH} ${selected.product.size}`,
+      price: selected.product.price,
+      time: new Date().toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }),
+      method: "PromptPay (Beam)",
+    });
+    setOrder(null);
+    setStage("unlocked");
+  };
+
+  if (view === "landing") {
+    return <LandingScreen serial={serial} cloud={cloud} backend={backend} onStart={() => setView("shop")} />;
+  }
+
+  return (
+    <div className="min-h-full flex flex-col relative" style={{ background: `linear-gradient(180deg, ${T.bgTop} 0%, ${T.bgBottom} 340px)` }}>
+      <div className="sticky top-0 z-30 flex items-center justify-between px-4 py-3.5"
+        style={{ background: "rgba(255,255,255,0.75)", backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", borderBottom: `1px solid ${T.hairline}` }}>
+        <div className="flex items-center gap-1.5">
+          <button onClick={() => setView("landing")} className="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style={{ color: T.sub }}>
+            <ChevronLeft size={19} />
+          </button>
+          <Logo size={28} />
+          <span className="text-[16px] font-bold text-[#0E1B2B] tracking-tight">Narm Pack</span>
+        </div>
+        <div className="flex items-center gap-1 text-[11px] font-medium px-2.5 py-1 rounded-full"
+          style={{ color: hwConnected ? T.aquaDeep : T.red, background: hwConnected ? "rgba(47,214,198,0.12)" : "rgba(255,69,58,0.10)" }}>
+          {hwConnected ? <Wifi size={11} /> : <WifiOff size={11} />}
+          {hwConnected ? "ตู้พร้อมใช้งาน" : "ตู้ออฟไลน์"}
+        </div>
+      </div>
+
+      <div className="px-6 pt-7 pb-5">
+        <p className="text-[13.5px] font-semibold tracking-wide" style={{ color: T.aquaDeep }}>Narm Pack · ตู้ CDW-014 · คอนโดริเวอร์วิว ชั้น 1</p>
+        <h1 className="text-[36px] font-bold text-[#0E1B2B] leading-[1.12] tracking-tight mt-1.5">น้ำดื่มสะอาด<br />พร้อมเสิร์ฟทันที</h1>
+        <p className="text-[16px] mt-2.5 leading-relaxed" style={{ color: T.sub }}>แตะเลือกช่อง ชำระเงินด้วย PromptPay แล้วรับน้ำได้ในไม่กี่วินาที</p>
+      </div>
+
+      <div className="px-6 flex items-center gap-4 pb-4">
+        {[{ c: T.aquaDeep, l: "ว่าง" }, { c: T.faint, l: "สินค้าหมด" }, { c: T.red, l: "ปิดปรับปรุง" }].map((s) => (
+          <span key={s.l} className="flex items-center gap-1.5 text-[12.5px] font-medium" style={{ color: T.sub }}>
+            <span className="w-2 h-2 rounded-full" style={{ background: s.c }} />{s.l}
+          </span>
+        ))}
+      </div>
+
+      <div className="px-6 pb-10 flex-1">
+        <div className="rounded-[22px] p-3" style={{ background: "linear-gradient(180deg, #EEF3F4 0%, #F7F9FA 100%)", border: `1px solid ${T.hairline}` }}>
+          {SHELF_PRODUCTS.map((product, row) => (
+            <div key={row} className={row > 0 ? "mt-3.5" : ""}>
+              <div className="flex items-center gap-2.5 rounded-2xl pl-2 pr-3 py-2 mb-2" style={{ background: `${product.color}1F` }}>
+                <div className="w-9 h-9 rounded-xl bg-white flex items-center justify-center shrink-0 overflow-hidden" style={{ boxShadow: "0 1px 2px rgba(14,27,43,0.08)" }}>
+                  <BottleGlyph color={product.color} size={22} />
+                </div>
+                <div className="flex flex-col leading-tight min-w-0">
+                  <span className="text-[10.5px] font-bold tracking-wide uppercase" style={{ color: product.color }}>ชั้น {row + 1}</span>
+                  <span className="text-[16px] font-bold text-[#0E1B2B] truncate">{product.brandTH} · {product.size}</span>
+                </div>
+              </div>
+              <div className="grid grid-cols-6 gap-1.5">
+                {lockers.filter((l) => l.row === row).map((l) => <CabinetCell key={l.id} locker={l} onSelect={openFor} />)}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <Sheet open={sheetOpen} onClose={stage === "checking" ? () => {} : closeSheet}>
+        {selected && stage === "confirm" && (
+          <div>
+            <div className="flex items-start justify-between">
+              <p className="text-[13px] font-semibold" style={{ color: T.aquaDeep }}>ช่อง #{String(selected.id).padStart(2, "0")}</p>
+              <button onClick={closeSheet} className="w-9 h-9 rounded-full flex items-center justify-center" style={{ background: T.grayFill }}>
+                <XIcon size={16} className="text-[#6B7684]" />
+              </button>
+            </div>
+            <div className="flex items-center gap-4 mt-2">
+              <div className="rounded-2xl flex items-center justify-center shrink-0 overflow-hidden" style={{ width: 92, height: 92, background: "linear-gradient(180deg, #F6F8F9 0%, #FFFFFF 100%)", border: `1px solid ${T.hairline}` }}>
+                <BottleGlyph color={selected.product.color} size={54} />
+              </div>
+              <div>
+                <h2 className="text-[24px] font-bold text-[#0E1B2B] tracking-tight leading-tight">{selected.product.brandTH}</h2>
+                <p className="text-[15px] mt-0.5" style={{ color: T.sub }}>{selected.product.size} · แพ็ค {selected.product.pack} ขวด</p>
+              </div>
+            </div>
+            <div className="flex items-center justify-between mt-5 px-4 py-4 rounded-2xl" style={{ background: waterGradSoft }}>
+              <span className="text-[14.5px] font-medium" style={{ color: T.sub }}>ยอดชำระทั้งหมด</span>
+              <span className="text-[26px] font-bold text-[#0E1B2B] tabular-nums">{money(selected.product.price)}</span>
+            </div>
+            {!hwConnected && (
+              <p className="text-[11px] mt-3 flex items-start gap-1" style={{ color: T.amber }}>
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                ยังไม่ได้เชื่อมต่อ ESP32 — จะจำลองการปลดล็อกแทน (กลับไปหน้าแรกเพื่อเชื่อมต่อของจริง)
+              </p>
+            )}
+            <button onClick={goToPayment}
+              className="w-full mt-5 text-white font-semibold text-[17px] py-4 rounded-2xl flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform"
+              style={{ background: waterGrad, boxShadow: "0 10px 24px -10px rgba(10,132,255,0.55)" }}>
+              ชำระด้วย PromptPay <ChevronRight size={19} />
+            </button>
+          </div>
+        )}
+        {selected && stage === "payment" && (
+          <div className="text-center">
+            <div className="flex items-center justify-between mb-1">
+              <button onClick={() => setStage("confirm")} className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: T.grayFill }}><ChevronLeft size={16} className="text-[#6B7684]" /></button>
+              <span className="text-[13px] font-semibold text-[#0E1B2B]">สแกนเพื่อชำระเงิน</span>
+              <button onClick={closeSheet} className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: T.grayFill }}><XIcon size={15} className="text-[#6B7684]" /></button>
+            </div>
+            <p className="text-[28px] font-bold text-[#0E1B2B] tabular-nums mt-3">{money(selected.product.price)}</p>
+            <div className="mt-4 rounded-[22px] p-5" style={{ border: `1px solid ${T.hairline}`, boxShadow: "0 1px 2px rgba(14,27,43,0.04)" }}>
+              <FakeQR seed={selected.id} />
+              <p className="text-[10.5px] mt-3 tracking-wide" style={{ color: T.faint }}>ORDER #{selected.id}{Date.now().toString().slice(-4)} · ระบบ Beam</p>
+            </div>
+            <div className="mt-5">
+              <CountdownRing pct={timeLeft / 180} label={`${mm}:${ss}`} />
+              <p className="text-[11.5px] mt-2" style={{ color: T.sub }}>QR จะหมดอายุเมื่อเวลาหมด</p>
+            </div>
+            <button onClick={confirmPayment} className="w-full mt-6 text-white font-semibold text-[14.5px] py-3.5 rounded-2xl active:scale-[0.98] transition-transform" style={{ background: T.ink }}>
+              จำลอง: จ่ายเงินสำเร็จ (Demo)
+            </button>
+            <p className="text-[10.5px] mt-2" style={{ color: T.faint }}>
+              {backend.configured
+                ? "เชื่อมต่อ Backend อยู่ — กดปุ่มนี้จะจำลอง Webhook จ่ายเงินสำเร็จ แล้ว Backend จะสั่งเปิดกลอนจริงผ่าน ESP32 ให้เอง"
+                : cloud.configured
+                ? "เชื่อมต่อออนไลน์อยู่ — กดปุ่มนี้จะสั่งเปิดกลอนจริงผ่าน Adafruit IO"
+                : serial.connected
+                ? "เชื่อมต่อ ESP32 อยู่ — กดปุ่มนี้จะสั่งเปิดกลอนจริงผ่าน relay"
+                : "ระบบจริงจะปลดล็อกอัตโนมัติทันทีที่ได้รับ Webhook จาก Beam — ปุ่มนี้จำลองไว้ทดสอบ"}
+            </p>
+            {hwError && (
+              <p className="text-[11px] mt-2 flex items-start gap-1 text-left" style={{ color: T.red }}>
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                {hwError}
+              </p>
+            )}
+          </div>
+        )}
+        {stage === "checking" && (
+          <div className="py-6 flex flex-col items-center text-center">
+            <Loader2 size={30} strokeWidth={2.3} className="animate-spin" style={{ color: T.blue }} />
+            <p className="text-[15.5px] font-semibold text-[#0E1B2B] mt-4">
+              {backend.configured ? "กำลังส่งไป Backend และรอ ESP32 ปลดล็อก…" : cloud.configured ? "กำลังสั่งเปิดกลอนผ่านคลาวด์…" : serial.connected ? "กำลังสั่งเปิดกลอนผ่าน ESP32…" : "กำลังตรวจสอบการชำระเงิน"}
+            </p>
+            <p className="text-[13px] mt-1" style={{ color: T.sub }}>โปรดรอสักครู่ กำลังปลดล็อกช่อง #{String(selectedId).padStart(2, "0")}</p>
+          </div>
+        )}
+        {selected && stage === "unlocked" && (
+          <div className="py-2 flex flex-col items-center text-center">
+            <div className="w-[72px] h-[72px] rounded-full flex items-center justify-center" style={{ background: waterGrad, boxShadow: "0 12px 28px -10px rgba(10,132,255,0.5)" }}>
+              <UnlockIcon size={30} className="text-white" strokeWidth={2.4} />
+            </div>
+            <h2 className="text-[23px] font-bold text-[#0E1B2B] tracking-tight mt-4">ช่อง #{String(selected.id).padStart(2, "0")} เปิดแล้ว</h2>
+            <p className="text-[15px] mt-1.5" style={{ color: T.sub }}>หยิบ{selected.product.brandTH} {selected.product.size} ได้เลย<br />ประตูจะล็อกอัตโนมัติใน 3 วินาที</p>
+            <div className="flex items-center gap-1.5 text-[13.5px] font-semibold mt-3.5 px-3.5 py-2 rounded-full" style={{ color: T.aquaDeep, background: "rgba(47,214,198,0.12)" }}>
+              <CheckCircle2 size={15} /> ชำระเงินสำเร็จ · {money(selected.product.price)}
+            </div>
+            <button onClick={closeSheet} className="w-full mt-7 font-semibold text-[16px] py-4 rounded-2xl flex items-center justify-center gap-2" style={{ background: T.grayFill, color: T.ink }}>
+              <RotateCcw size={15} /> เสร็จสิ้น
+            </button>
+          </div>
+        )}
+      </Sheet>
+    </div>
+  );
+}
+
+function AdminLockerCell({ locker, onOpen }) {
+  const disabled = locker.status !== "available";
+  return (
+    <button onClick={() => !disabled && onOpen(locker.id)}
+      className={`relative rounded-lg p-2 text-left border ${locker.status === "available" ? "bg-white border-[#D9DEE3]" : locker.status === "soldout" ? "bg-[#EDEFF1] border-[#D9DEE3]" : "bg-[#FF453A]/10 border-[#FF453A]/25"}`}>
+      <span className="text-[10px] font-semibold text-[#6B7684]">#{String(locker.id).padStart(2, "0")}</span>
+      <span className="block w-1.5 h-1.5 rounded-full mt-1" style={{ background: locker.status === "available" ? T.aquaDeep : locker.status === "soldout" ? T.faint : T.red }} />
+      {locker.status !== "offline" && (
+        <span className="flex items-center gap-0.5 text-[9px] text-[#0E1B2B] mt-1"><KeyRound size={9} /> เปิด</span>
+      )}
+    </button>
+  );
+}
+
+function StatCard({ label, value, color }) {
+  return (
+    <div className="bg-white border rounded-xl p-3" style={{ borderColor: T.hairline }}>
+      <p className="text-[10.5px]" style={{ color: T.faint }}>{label}</p>
+      <p className="text-[18px] font-bold" style={{ color }}>{value}</p>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ADMIN DASHBOARD — connect/disconnect ESP32, manual open, and
+   a raw serial log so you can see exactly what the board reports.
+--------------------------------------------------------- */
+function AdminApp({ lockers, setLockers, transactions, serial, cloud, backend, refreshLockers }) {
+  const [authed, setAuthed] = useState(false);
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(false);
+  const [aioUsername, setAioUsername] = useState(cloud.username);
+  const [aioKey, setAioKey] = useState("");
+  const [aioFeed, setAioFeed] = useState(cloud.feed);
+  const [backendUrlInput, setBackendUrlInput] = useState(backend.baseUrl);
+  const [adminUsername, setAdminUsername] = useState("");
+  const [adminPassword, setAdminPassword] = useState("");
+  const logEndRef = useRef(null);
+  const cloudLogEndRef = useRef(null);
+  const backendLogEndRef = useRef(null);
+
+  useEffect(() => {
+    logEndRef.current && logEndRef.current.scrollIntoView({ block: "nearest" });
+  }, [serial.log]);
+  useEffect(() => {
+    cloudLogEndRef.current && cloudLogEndRef.current.scrollIntoView({ block: "nearest" });
+  }, [cloud.log]);
+  useEffect(() => {
+    backendLogEndRef.current && backendLogEndRef.current.scrollIntoView({ block: "nearest" });
+  }, [backend.log]);
+
+  if (!authed) {
+    return (
+      <div className="min-h-full flex flex-col items-center justify-center px-8" style={{ background: T.ink }}>
+        <Logo size={52} radius={16} />
+        <p className="text-[18px] font-bold text-white tracking-tight mt-4">Narm Pack</p>
+        <p className="text-[12px] text-white/50 mt-1 mb-5 flex items-center gap-1.5"><ShieldCheck size={13} /> แผงควบคุม · ตู้ CDW-014</p>
+        <input type="password" value={pw} onChange={(e) => { setPw(e.target.value); setErr(false); }} placeholder="รหัสผ่าน (demo: 1234)"
+          className="w-full bg-white/10 border border-white/15 text-white text-[14px] px-4 py-3 rounded-xl placeholder:text-white/30 outline-none focus:border-[#2FD6C6]" />
+        {err && <p className="text-[11px] text-[#FF8A80] mt-2">รหัสผ่านไม่ถูกต้อง</p>}
+        <button onClick={() => (pw === "1234" ? setAuthed(true) : setErr(true))} className="w-full mt-3 text-white font-semibold text-[14px] py-3 rounded-xl" style={{ background: waterGrad }}>เข้าสู่ระบบ</button>
+      </div>
+    );
+  }
+
+  const manualOpen = async (id) => {
+    setLockers((prev) => prev.map((l) => (l.id === id ? { ...l, status: "soldout" } : l)));
+    try {
+      if (backend.configured && backend.adminLoggedIn) {
+        await backend.adminManualOpen(DEFAULT_MACHINE_ID, id);
+      } else if (cloud.configured) {
+        await cloud.sendUnlock(id);
+      } else if (serial.connected) {
+        await serial.sendUnlock(id);
+      }
+    } catch (e) {}
+  };
+  // "เติมของ" — after physically refilling a compartment, put it back on
+  // sale. Writes through to the backend (so it sticks for every customer
+  // and every device, not just this browser tab) when logged in, and
+  // always updates the local grid immediately either way.
+  const restock = async (locker) => {
+    try {
+      if (backend.configured && backend.adminLoggedIn && locker.dbId != null) {
+        await backend.restockCompartment(locker.dbId);
+      }
+    } catch (e) {}
+    setLockers((prev) => prev.map((l) => (l.id === locker.id ? { ...l, status: "available" } : l)));
+  };
+  const restockAll = async () => {
+    for (const l of lockers.filter((l) => l.status === "soldout")) {
+      await restock(l);
+    }
+  };
+  const available = lockers.filter((l) => l.status === "available").length;
+  const soldout = lockers.filter((l) => l.status === "soldout").length;
+  const offline = lockers.filter((l) => l.status === "offline").length;
+  const todayRevenue = transactions.reduce((s, t) => s + t.price, 0);
+
+  return (
+    <div className="min-h-full" style={{ background: "#F6F7F8" }}>
+      <div className="text-white px-5 pt-6 pb-5" style={{ background: T.ink }}>
+        <div className="flex items-center gap-2 mb-3"><Logo size={24} /><span className="text-[13px] font-semibold tracking-tight">Narm Pack</span></div>
+        <p className="text-[12px] text-white/50">แผงควบคุม</p>
+        <p className="text-[19px] font-semibold tracking-tight">ตู้ CDW-014</p>
+        <div className="flex items-center gap-2 mt-3 flex-wrap">
+          <span className="flex items-center gap-1.5 text-[11px] px-3 py-1.5 rounded-full"
+            style={{ color: backend.configured ? T.aqua : "#FF8A80", background: backend.configured ? "rgba(47,214,198,0.18)" : "rgba(255,69,58,0.18)" }}>
+            {backend.configured ? <Wifi size={12} /> : <WifiOff size={12} />}
+            {backend.configured ? `Backend เชื่อมต่ออยู่${backend.adminLoggedIn ? " (แอดมิน)" : ""}` : "Backend ยังไม่ได้ตั้งค่า"}
+          </span>
+          <span className="flex items-center gap-1.5 text-[11px] px-3 py-1.5 rounded-full"
+            style={{ color: cloud.configured ? T.aqua : "#FF8A80", background: cloud.configured ? "rgba(47,214,198,0.18)" : "rgba(255,69,58,0.18)" }}>
+            {cloud.configured ? <Wifi size={12} /> : <WifiOff size={12} />}
+            {cloud.configured ? `คลาวด์เชื่อมต่ออยู่ (${cloud.username})` : "คลาวด์ยังไม่ได้ตั้งค่า"}
+          </span>
+          <button onClick={serial.connected ? serial.disconnect : serial.connect}
+            className="flex items-center gap-1.5 text-[11px] px-3 py-1.5 rounded-full"
+            style={{ color: serial.connected ? T.aqua : "#FF8A80", background: serial.connected ? "rgba(47,214,198,0.18)" : "rgba(255,69,58,0.18)" }}>
+            {serial.connected ? <Wifi size={12} /> : <WifiOff size={12} />}
+            {serial.connected ? "USB เชื่อมต่ออยู่ · แตะเพื่อตัดการเชื่อมต่อ" : "USB ออฟไลน์ · แตะเพื่อเชื่อมต่อ"}
+          </button>
+        </div>
+      </div>
+      <div className="px-5 -mt-3">
+        <div className="grid grid-cols-3 gap-2">
+          <StatCard label="ว่าง" value={available} color={T.aquaDeep} />
+          <StatCard label="ขายแล้ว" value={soldout} color={T.faint} />
+          <StatCard label="ออฟไลน์" value={offline} color={T.red} />
+        </div>
+      </div>
+      <div className="px-5 mt-5">
+        <div className="bg-white border rounded-2xl p-4" style={{ borderColor: T.hairline }}>
+          <p className="text-[12px]" style={{ color: T.sub }}>ยอดขายวันนี้</p>
+          <p className="text-[24px] font-bold text-[#0E1B2B]">{money(todayRevenue)}</p>
+        </div>
+      </div>
+      <div className="px-5 mt-6">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-1.5"><Grid3x3 size={14} className="text-[#0E1B2B]" /><p className="text-[13px] font-semibold text-[#0E1B2B]">สถานะช่อง · เปิดฉุกเฉิน</p></div>
+          {backend.configured && (
+            <button onClick={refreshLockers} className="flex items-center gap-1 text-[10.5px] font-medium px-2 py-1 rounded-full" style={{ color: T.sub, background: T.grayFill }}>
+              <RotateCcw size={10} /> รีเฟรช
+            </button>
+          )}
+        </div>
+        <div className="grid grid-cols-6 gap-2">
+          {lockers.map((l) => <AdminLockerCell key={l.id} locker={l} onOpen={manualOpen} />)}
+        </div>
+        <p className="text-[10.5px] mt-2 flex items-start gap-1" style={{ color: T.faint }}>
+          <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+          ใช้ปุ่มนี้เมื่อเน็ตตู้หลุด หรือลูกค้าจ่ายเงินแล้วแต่ประตูไม่เปิด — ถ้าเชื่อมต่อ ESP32 อยู่ จะสั่ง relay จริงด้วย
+        </p>
+      </div>
+      {soldout > 0 && (
+        <div className="px-5 mt-6">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-1.5"><RotateCcw size={14} className="text-[#0E1B2B]" /><p className="text-[13px] font-semibold text-[#0E1B2B]">เติมของ (คืนสถานะว่าง)</p></div>
+            <button onClick={restockAll} className="text-[11px] font-semibold px-2.5 py-1 rounded-full" style={{ color: "#fff", background: waterGrad }}>เติมของทั้งหมด</button>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {lockers.filter((l) => l.status === "soldout").map((l) => (
+              <button key={l.id} onClick={() => restock(l)}
+                className="flex items-center gap-1 text-[11px] font-medium px-2.5 py-1.5 rounded-lg border"
+                style={{ borderColor: T.hairline, color: T.ink, background: "#fff" }}>
+                #{String(l.id).padStart(2, "0")} <RotateCcw size={10} style={{ color: T.aquaDeep }} />
+              </button>
+            ))}
+          </div>
+          <p className="text-[10.5px] mt-2" style={{ color: T.faint }}>
+            กดช่องที่เติมน้ำเสร็จแล้วเพื่อเปิดขายใหม่ — ถ้าล็อกอินแอดมินกับ Backend อยู่ จะบันทึกไว้ที่เซิร์ฟเวอร์ให้ทุกเครื่องเห็นตรงกัน
+          </p>
+        </div>
+      )}
+      <div className="px-5 mt-6">
+        <div className="flex items-center gap-1.5 mb-3"><Wifi size={14} className="text-[#0E1B2B]" /><p className="text-[13px] font-semibold text-[#0E1B2B]">เชื่อมต่อ Backend Server (แนะนำ)</p></div>
+        <div className="bg-white border rounded-2xl p-4" style={{ borderColor: T.hairline }}>
+          <p className="text-[11px] mb-3" style={{ color: T.faint }}>
+            ใส่ URL ของ Backend ที่ deploy ไว้ (เช่น https://your-app.up.railway.app) — ตั้งครั้งเดียวที่นี่ หน้าลูกค้าจะสั่งซื้อ/ปลดล็อกผ่าน Backend แทนการต่อ Adafruit IO ตรงๆ จากเบราว์เซอร์ (ไม่ต้องพก AIO Key อีกต่อไป — Backend เก็บไว้ให้ฝั่งเซิร์ฟเวอร์แล้ว)
+          </p>
+          <div className="flex flex-col gap-2">
+            <input value={backendUrlInput} onChange={(e) => setBackendUrlInput(e.target.value)} placeholder="https://your-backend-url"
+              className="w-full border text-[13px] px-3 py-2.5 rounded-xl outline-none focus:border-[#2FD6C6]" style={{ borderColor: T.hairline }} />
+          </div>
+          <div className="flex items-center gap-2 mt-3">
+            <button
+              onClick={() => backend.saveBaseUrl(backendUrlInput)}
+              disabled={!backendUrlInput}
+              className="flex-1 text-white font-semibold text-[13px] py-2.5 rounded-xl disabled:opacity-40"
+              style={{ background: T.ink }}>
+              บันทึก Backend URL
+            </button>
+            {backend.configured && (
+              <button onClick={() => { backend.clearBaseUrl(); setBackendUrlInput(""); }}
+                className="text-[13px] font-medium px-4 py-2.5 rounded-xl" style={{ background: T.grayFill, color: T.sub }}>
+                ล้างค่า
+              </button>
+            )}
+          </div>
+          {backend.configured && (
+            <div className="mt-4 pt-4" style={{ borderTop: `1px solid ${T.hairline}` }}>
+              <p className="text-[11px] mb-2" style={{ color: T.faint }}>เข้าสู่ระบบแอดมิน (สำหรับปุ่มเปิดฉุกเฉินผ่าน Backend ด้านบน)</p>
+              {backend.adminLoggedIn ? (
+                <p className="text-[12.5px] font-medium flex items-center gap-1.5" style={{ color: T.aquaDeep }}><CheckCircle2 size={13} /> เข้าสู่ระบบแล้ว</p>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <input value={adminUsername} onChange={(e) => setAdminUsername(e.target.value)} placeholder="Admin username"
+                    className="w-full border text-[13px] px-3 py-2.5 rounded-xl outline-none focus:border-[#2FD6C6]" style={{ borderColor: T.hairline }} />
+                  <input value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} type="password" placeholder="Admin password"
+                    className="w-full border text-[13px] px-3 py-2.5 rounded-xl outline-none focus:border-[#2FD6C6]" style={{ borderColor: T.hairline }} />
+                  <button
+                    onClick={() => backend.adminLogin(adminUsername, adminPassword).catch(() => {})}
+                    disabled={!adminUsername || !adminPassword}
+                    className="text-white font-semibold text-[13px] py-2.5 rounded-xl disabled:opacity-40"
+                    style={{ background: waterGrad }}>
+                    เข้าสู่ระบบแอดมิน
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          {backend.error && <p className="text-[11px] mt-2" style={{ color: T.red }}>{backend.error}</p>}
+        </div>
+        <div className="bg-[#0E1B2B] rounded-2xl p-3 h-28 overflow-y-auto font-mono text-[10.5px] text-[#8FE3D8] leading-relaxed mt-2">
+          {backend.log.length === 0 ? (
+            <p className="text-white/30">ยังไม่มีข้อมูล — ตั้งค่า URL แล้วลองสั่งซื้อดู</p>
+          ) : (
+            backend.log.map((line, i) => <div key={i}>{line}</div>)
+          )}
+          <div ref={backendLogEndRef} />
+        </div>
+      </div>
+      <div className="px-5 mt-6">
+        <div className="flex items-center gap-1.5 mb-3"><Wifi size={14} className="text-[#0E1B2B]" /><p className="text-[13px] font-semibold text-[#0E1B2B]">เชื่อมต่อตรงกับ Adafruit IO (สำรอง/ทดสอบเร็ว)</p></div>
+        <div className="bg-white border rounded-2xl p-4" style={{ borderColor: T.hairline }}>
+          <p className="text-[11px] mb-3" style={{ color: T.faint }}>
+            ใช้ได้เมื่อยังไม่ได้ตั้งค่า Backend ด้านบน — สมัครฟรีที่ io.adafruit.com แล้วเอา Username กับ Active Key มาใส่ที่นี่ ค่าจะถูกเก็บไว้ในเบราว์เซอร์เครื่องนี้เท่านั้น (ถ้าตั้งค่า Backend ไว้แล้ว ระบบจะใช้ Backend ก่อนเสมอ)
+          </p>
+          <div className="flex flex-col gap-2">
+            <input value={aioUsername} onChange={(e) => setAioUsername(e.target.value)} placeholder="Adafruit IO Username"
+              className="w-full border text-[13px] px-3 py-2.5 rounded-xl outline-none focus:border-[#2FD6C6]" style={{ borderColor: T.hairline }} />
+            <input value={aioKey} onChange={(e) => setAioKey(e.target.value)} type="password" placeholder={cloud.configured ? "AIO Key (กรอกใหม่เพื่อเปลี่ยน)" : "AIO Key"}
+              className="w-full border text-[13px] px-3 py-2.5 rounded-xl outline-none focus:border-[#2FD6C6]" style={{ borderColor: T.hairline }} />
+            <input value={aioFeed} onChange={(e) => setAioFeed(e.target.value)} placeholder="ชื่อ Feed (ค่าเริ่มต้น: vending-unlock)"
+              className="w-full border text-[13px] px-3 py-2.5 rounded-xl outline-none focus:border-[#2FD6C6]" style={{ borderColor: T.hairline }} />
+          </div>
+          <div className="flex items-center gap-2 mt-3">
+            <button
+              onClick={() => cloud.saveCredentials(aioUsername, aioKey, aioFeed)}
+              disabled={!aioUsername || !aioKey}
+              className="flex-1 text-white font-semibold text-[13px] py-2.5 rounded-xl disabled:opacity-40"
+              style={{ background: T.ink }}>
+              บันทึกการตั้งค่า
+            </button>
+            {cloud.configured && (
+              <button onClick={() => { cloud.clearCredentials(); setAioKey(""); }}
+                className="text-[13px] font-medium px-4 py-2.5 rounded-xl" style={{ background: T.grayFill, color: T.sub }}>
+                ล้างค่า
+              </button>
+            )}
+          </div>
+          {cloud.error && <p className="text-[11px] mt-2" style={{ color: T.red }}>{cloud.error}</p>}
+        </div>
+        <div className="bg-[#0E1B2B] rounded-2xl p-3 h-28 overflow-y-auto font-mono text-[10.5px] text-[#8FE3D8] leading-relaxed mt-2">
+          {cloud.log.length === 0 ? (
+            <p className="text-white/30">ยังไม่มีข้อมูล — ตั้งค่าแล้วลองสั่งเปิดช่องดู</p>
+          ) : (
+            cloud.log.map((line, i) => <div key={i}>{line}</div>)
+          )}
+          <div ref={cloudLogEndRef} />
+        </div>
+      </div>
+      <div className="px-5 mt-6">
+        <div className="flex items-center gap-1.5 mb-3"><UsbIcon size={14} className="text-[#0E1B2B]" /><p className="text-[13px] font-semibold text-[#0E1B2B]">Serial Log (ESP32 · USB)</p></div>
+        <div className="bg-[#0E1B2B] rounded-2xl p-3 h-40 overflow-y-auto font-mono text-[10.5px] text-[#8FE3D8] leading-relaxed">
+          {serial.log.length === 0 ? (
+            <p className="text-white/30">ยังไม่มีข้อมูล — เชื่อมต่อ ESP32 แล้วลองสั่งเปิดช่องดู</p>
+          ) : (
+            serial.log.map((line, i) => <div key={i}>{line}</div>)
+          )}
+          <div ref={logEndRef} />
+        </div>
+      </div>
+      <div className="px-5 mt-6 pb-8">
+        <div className="flex items-center gap-1.5 mb-3"><History size={14} className="text-[#0E1B2B]" /><p className="text-[13px] font-semibold text-[#0E1B2B]">ประวัติการขาย</p></div>
+        <div className="bg-white border rounded-2xl divide-y" style={{ borderColor: T.hairline }}>
+          {transactions.length === 0 && <p className="text-[12px] p-4 text-center" style={{ color: T.faint }}>ยังไม่มีรายการขาย</p>}
+          {[...transactions].reverse().map((t) => (
+            <div key={t.id} className="flex items-center justify-between px-4 py-3">
+              <div><p className="text-[13px] font-medium text-[#0E1B2B]">ช่อง #{String(t.locker).padStart(2, "0")} · {t.brand}</p><p className="text-[11px]" style={{ color: T.faint }}>{t.time} · {t.method}</p></div>
+              <p className="text-[13px] font-semibold text-[#0E1B2B]">{money(t.price)}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ROOT
+--------------------------------------------------------- */
+function App() {
+  const [lockers, setLockers] = useState(seedLockers());
+  const [transactions, setTransactions] = useState([]);
+  const [mode, setMode] = useState("customer");
+  const serial = useSerialBridge();
+  const cloud = useCloudBridge();
+  const backend = useBackendBridge();
+  const pushTx = (tx) => setTransactions((prev) => [...prev, tx]);
+
+  // Pulls real compartment status (available / sold / maintenance) and each
+  // compartment's real DB row id from the backend, and merges it into the
+  // local lockers (matched by compartment_no === locker.id). Without a
+  // backend configured, lockers keep whatever local/demo status they have.
+  // This is what makes "เติมของ" (restock) in Admin actually stick across
+  // page reloads and other devices, instead of resetting randomly on load.
+  const refreshLockers = async () => {
+    if (!backend.configured) return;
+    try {
+      const rows = await backend.getCompartments(DEFAULT_MACHINE_ID);
+      setLockers((prev) =>
+        prev.map((l) => {
+          const row = rows.find((r) => r.compartment_no === l.id);
+          if (!row) return l;
+          const status = row.status === "available" ? "available" : row.status === "maintenance" ? "offline" : "soldout";
+          return { ...l, dbId: row.id, status };
+        })
+      );
+    } catch (e) {
+      // best-effort — keep whatever local state we already have
+    }
+  };
+  useEffect(() => {
+    refreshLockers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backend.configured]);
+
+  return (
+    <div className="w-full h-screen bg-[#F6F7F8] flex justify-center">
+      <div className="w-full max-w-[420px] h-full relative flex flex-col overflow-hidden" style={{ background: "#fff", transform: "translateZ(0)" }}>
+        <div className="flex-1 min-h-0 overflow-y-auto relative">
+          {mode === "customer" ? (
+            <CustomerApp lockers={lockers} setLockers={setLockers} pushTx={pushTx} serial={serial} cloud={cloud} backend={backend} />
+          ) : (
+            <AdminApp lockers={lockers} setLockers={setLockers} transactions={transactions} serial={serial} cloud={cloud} backend={backend} refreshLockers={refreshLockers} />
+          )}
+        </div>
+        <div className="flex z-50 shrink-0" style={{ background: "rgba(255,255,255,0.85)", backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", borderTop: `1px solid ${T.hairline}` }}>
+          <button onClick={() => setMode("customer")} className="flex-1 text-[12px] py-3 font-medium flex items-center justify-center gap-1.5" style={{ color: mode === "customer" ? T.aquaDeep : T.faint }}>
+            <QrCode size={14} /> หน้าลูกค้า
+          </button>
+          <button onClick={() => setMode("admin")} className="flex-1 text-[12px] py-3 font-medium flex items-center justify-center gap-1.5" style={{ color: mode === "admin" ? T.aquaDeep : T.faint, borderLeft: `1px solid ${T.hairline}` }}>
+            <LockIcon size={14} /> หลังบ้าน (Admin)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+<script>
+  // Manually run Babel with the classic JSX runtime (React.createElement),
+  // instead of Babel's auto data-presets scan. Newer @babel/standalone
+  // defaults the "react" preset to the automatic runtime, which injects
+  // `import { jsx as _jsx } from "react/jsx-runtime"` into the compiled
+  // output — that breaks in a plain (non-module) <script> tag, especially
+  // when the page is opened as a local file:// URL, with:
+  //   "Uncaught SyntaxError: Cannot use import statement outside a module"
+  // Forcing runtime: "classic" makes Babel emit React.createElement(...)
+  // calls against the global `React` from the UMD build loaded above.
+  (function () {
+    var sourceEl = document.getElementById("app-source");
+    var code = sourceEl.textContent;
+    var output = Babel.transform(code, {
+      presets: [["react", { runtime: "classic" }]],
+    }).code;
+    var runScript = document.createElement("script");
+    runScript.text = output;
+    document.body.appendChild(runScript);
+  })();
+</script>
+</body>
+</html>
